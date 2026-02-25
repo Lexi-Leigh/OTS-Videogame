@@ -1,0 +1,1522 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OLD TIME SPORTS - the game</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+
+  <style>
+    html,body{margin:0;padding:0;background:#111;color:#eaeaea}
+    .wrap{display:flex;flex-direction:column;align-items:center;gap:10px;padding:14px 10px}
+    canvas{image-rendering:pixelated;image-rendering:crisp-edges;border:1px solid rgba(255,255,255,.18);background:#000}
+    .panel{
+      width:min(720px,calc(100vw - 24px));
+      font-family: "Press Start 2P", ui-monospace, Menlo, Consolas, monospace;
+      font-size:12px;line-height:1.5;
+      background:rgba(255,255,255,.04);
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:10px;
+      padding:10px 12px;
+    }
+    .panel kbd{background:#222;border:1px solid #444;padding:1px 6px;border-radius:6px}
+    .row{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between}
+    .muted{color:rgba(255,255,255,.72)}
+    .hearts{letter-spacing:2px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game" width="512" height="288"></canvas>
+
+  <div class="panel">
+    <div class="row">
+      <div>
+        Controls: <kbd>←</kbd><kbd>→</kbd> move &nbsp; <kbd>Space</kbd> jump / fly &nbsp; <kbd>A</kbd> start
+        <div class="muted">Power-ups: bump evil sports balls from underneath (they disappear after).</div>
+      </div>
+      <div>
+        Shirts: <b id="count">0</b> &nbsp; | &nbsp; Current: <b id="shirt">none</b><br/>
+        Lives: <b id="hearts" class="hearts">❤ ❤ ❤</b>
+        <div class="muted">Win: reach the shopping cart (you do NOT need all shirts).</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const VW = canvas.width, VH = canvas.height;
+  ctx.imageSmoothingEnabled = false;
+
+  const countEl  = document.getElementById("count");
+  const shirtEl  = document.getElementById("shirt");
+  const heartsEl = document.getElementById("hearts");
+
+  // ===== Input =====
+  const keys = new Set();
+  let jumpQueued = false;
+  let startQueued = false;
+  window.addEventListener("keydown", (e) => {
+    if (["ArrowLeft","ArrowRight","Space","KeyA"].includes(e.code)) e.preventDefault();
+    keys.add(e.code);
+    if (e.code === "Space") jumpQueued = true;
+    if (e.code === "KeyA") startQueued = true;
+    if (!audio.unlocked) audio.unlock();
+  });
+  window.addEventListener("keyup", (e) => keys.delete(e.code));
+
+  // ===== Audio =====
+  const audio = {
+    ctx: null, unlocked:false,
+    unlock(){
+      try{
+        if(!this.ctx) this.ctx = new (window.AudioContext||window.webkitAudioContext)();
+        const o=this.ctx.createOscillator(), g=this.ctx.createGain();
+        g.gain.value=0.00001; o.connect(g).connect(this.ctx.destination);
+        o.start(); o.stop(this.ctx.currentTime+0.01);
+        this.unlocked=true;
+      }catch{}
+    },
+    beep({type="square", f=440, dur=0.08, vol=0.06, slideTo=null}={}){
+      if(!this.ctx) return;
+      const t0=this.ctx.currentTime;
+      const o=this.ctx.createOscillator(), g=this.ctx.createGain();
+      o.type=type;
+      o.frequency.setValueAtTime(f,t0);
+      if(slideTo!=null) o.frequency.exponentialRampToValueAtTime(slideTo,t0+dur);
+      g.gain.setValueAtTime(0.0001,t0);
+      g.gain.exponentialRampToValueAtTime(vol,t0+0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001,t0+dur);
+      o.connect(g).connect(this.ctx.destination);
+      o.start(t0); o.stop(t0+dur+0.02);
+    },
+    jump(){ this.beep({type:"square", f:520, slideTo:780, dur:0.09, vol:0.05}); },
+    pickup(){ this.beep({type:"triangle", f:660, slideTo:990, dur:0.06, vol:0.05}); },
+    pop(){ this.beep({type:"square", f:860, slideTo:520, dur:0.07, vol:0.05}); },
+    hurt(){ this.beep({type:"square", f:220, slideTo:140, dur:0.10, vol:0.06}); },
+    win(){
+      this.beep({type:"triangle", f:523, dur:0.08, vol:0.06});
+      setTimeout(()=>this.beep({type:"triangle", f:659, dur:0.08, vol:0.06}), 90);
+      setTimeout(()=>this.beep({type:"triangle", f:784, dur:0.12, vol:0.06}), 180);
+    }
+  };
+
+  // ===== Text helpers =====
+  function text(str, x, y, size=14, color="#fff", align="center"){
+    ctx.fillStyle = color;
+    ctx.font = `${size}px "Press Start 2P", ui-monospace, Menlo, Consolas, monospace`;
+    ctx.textAlign = align;
+    ctx.textBaseline = "top";
+    ctx.fillText(str, x, y);
+  }
+  function measureTextPx(str, size){
+    ctx.font = `${size}px "Press Start 2P", ui-monospace, Menlo, Consolas, monospace`;
+    return ctx.measureText(str).width;
+  }
+  function bubbleText(str, x, y, size=10){
+    const w = measureTextPx(str, size);
+    const padX = 6, padY = 5;
+    const boxW = (w + padX*2)|0;
+    const boxH = (size + padY*2)|0;
+
+    let bx = (x - boxW/2)|0;
+    let by = (y)|0;
+
+    bx = Math.max(4, Math.min(VW - boxW - 4, bx));
+    by = Math.max(4, Math.min(VH - boxH - 4, by));
+
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(bx, by, boxW, boxH);
+    ctx.fillStyle = "rgba(255,255,255,0.18)";
+    ctx.fillRect(bx, by, boxW, 2);
+
+    text(str, (bx + boxW/2)|0, (by + padY)|0, size, "#fff", "center");
+  }
+
+  // ===== Helpers =====
+  const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+  function aabb(ax,ay,aw,ah,bx,by,bw,bh){
+    return ax<bx+bw && ax+aw>bx && ay<by+bh && ay+ah>by;
+  }
+
+  // ===== Physics / world =====
+  const GRAV_GROUND=0.55, GRAV_SKY=0.28;
+  const MOVE=1.8, JUMP=8.8, MAX_FALL=10.5, FRICTION=0.82;
+
+  const WORLD_W=1600;
+  const camera={x:0,y:0};
+  const SEG_W=420;
+
+  const player={
+    x:24,y:VH-64,w:14,h:18,vx:0,vy:0,onGround:false,dir:1,
+    hasDoubleJump:false, jumpsLeft:1,
+    hasWings:false,
+    flyFuelMs:0,
+    invulnMs:0
+  };
+
+  const ui={ lives:3 };
+  function setLives(n){
+    ui.lives=n;
+    heartsEl.textContent = Array.from({length:3},(_,i)=> i<n ? "❤" : "·").join(" ");
+  }
+
+  const shirts={
+    currentColor:null,
+    collected:[],
+    rainbowUntilMs:0,
+    rainbowActive(nowMs){ return nowMs < this.rainbowUntilMs; }
+  };
+  function setCurrentShirtColor(c){
+    shirts.currentColor=c;
+    shirtEl.textContent=c?c:"none";
+  }
+
+  // ===== HUD hearts in-canvas (top-left) =====
+  function drawHudHearts(){
+    ctx.font = `12px "Press Start 2P", ui-monospace, Menlo, Consolas, monospace`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    for(let i=0;i<3;i++){
+      ctx.fillStyle = (i < ui.lives) ? "#ff2b2b" : "rgba(255,255,255,0.18)";
+      ctx.fillText("❤", 8 + i*18, 8);
+    }
+  }
+
+  // ===== Message bubble =====
+  const msg={text:"",untilMs:0};
+  function showMsg(s, ms, now){ msg.text=s; msg.untilMs=now+ms; }
+
+  // ===== Game states =====
+  const STATE={TITLE:0,PLAY:1,TRANSITION:2,WIN:3,GAMEOVER:4};
+  let state=STATE.TITLE;
+
+  // ===== Phases =====
+  const PHASE={GROUND:0,SKY:1};
+  let phase=PHASE.GROUND;
+
+  // ===== Transition (wings) =====
+  const transition={ t:0, dur:1700 };
+
+  // ===== World mapping =====
+  function worldToScreenX(wx){ return (wx - camera.x) | 0; }
+  function worldToScreenY(wy){ return (wy - camera.y) | 0; }
+  function seg(){ return Math.floor(player.x/SEG_W); }
+
+  // ✅ track which ground segment we're currently in (0,1,2,3...)
+  // and permanently delete traffic from earlier segments once you move forward.
+  let currentSeg = 0;
+
+  // ===== Platforms =====
+  const groundY = VH-32;
+
+  const platformsGround=[
+    {x:0,y:groundY,w:WORLD_W,h:32},
+    {x:80,y:VH-86,w:120,h:16},
+    {x:240,y:VH-118,w:110,h:16},
+    {x:400,y:VH-98,w:140,h:16},
+    {x:620,y:VH-92,w:150,h:16},
+    {x:820,y:VH-132,w:130,h:16},
+    {x:1020,y:VH-110,w:160,h:16},
+    {x:1240,y:VH-148,w:140,h:16},
+    {x:1440,y:VH-120,w:120,h:16},
+  ];
+
+  const skyFloorY = -1200;
+  const platformsSky=[
+    {x:220,y:-120,w:120,h:16,cloud:true},
+    {x:80,y:-220,w:110,h:16,cloud:true},
+    {x:320,y:-320,w:140,h:16,cloud:true},
+    {x:160,y:-430,w:120,h:16,cloud:true},
+    {x:280,y:-560,w:160,h:16,cloud:true},
+    {x:110,y:-700,w:140,h:16,cloud:true},
+    {x:240,y:-850,w:170,h:16,cloud:true},
+    {x:160,y:-1020,w:190,h:16,cloud:true},
+  ];
+
+  function activePlatforms(){
+    return (phase===PHASE.GROUND) ? platformsGround : platformsSky;
+  }
+
+  // ===== Evil sports balls =====
+  const balls=[
+    {x:320,y:VH-188,r:14,kind:"football",used:false,power:"doublejump"},
+    {x:760,y:VH-188,r:14,kind:"baseball",used:false,power:"disco"},
+    {x:1120,y:VH-188,r:14,kind:"basketball",used:false,power:"wings"},
+  ];
+
+  // ===== Goal carts (ONLY ONE WIN CART: sky cart) =====
+  const goal={ x:WORLD_W-160, y:VH-74, w:72,h:44, reached:false, disabled:true };
+  const skyGoal={ x:220, y:-1120, w:72,h:44, reached:false };
+
+  // ===== Pickups (shirts) =====
+  const baseShirtColors=["#3ad5ff","#ffd23a","#ff5bd6","#7cff6b","#7b61ff","#ffffff","#ff4f4f","#b6ff3a","#3affc6","#ffa23a","#9b61ff","#3a7bff"];
+  const pickups=[];
+  function addShirt(x,y,color){ pickups.push({x,y,kind:"shirt",color, collected:false}); }
+
+  function staticBlockers(){
+    const arr=[];
+    for(const b of balls){
+      const r = ballRect(b);
+      arr.push({x:r.bx, y:r.by, w:r.bw, h:r.bh});
+    }
+    arr.push({x:skyGoal.x, y:skyGoal.y, w:skyGoal.w, h:skyGoal.h});
+    return arr;
+  }
+  function overlapsAnyBlocker(px,py,pw,ph, blocks){
+    for(const bb of blocks){
+      if(aabb(px,py,pw,ph, bb.x,bb.y,bb.w,bb.h)) return true;
+    }
+    return false;
+  }
+
+  function clearAndBuildPickups(){
+    pickups.length=0;
+
+    let i=0;
+    const groundShirtPlatforms = platformsGround.filter(p => p !== platformsGround[0]);
+    const spots = [0,1,2,3,4,5,6,7].map(k => groundShirtPlatforms[k]);
+
+    for(const pl of spots){
+      const x = pl.x + 18 + (i%3)*28;
+      const y = pl.y - 28;
+      addShirt(x, y, baseShirtColors[i%baseShirtColors.length]);
+      i++;
+    }
+
+    const groundYTop = platformsGround[0].y;
+    const gx = [140, 520, 900, 1320];
+    for(let k=0;k<gx.length;k++){
+      addShirt(gx[k], groundYTop - 34, baseShirtColors[(i++)%baseShirtColors.length]);
+    }
+
+    let j=0;
+    for(const c of platformsSky){
+      addShirt(c.x + 20, c.y - 30, baseShirtColors[(j++)%baseShirtColors.length]);
+      if(j%2===0) addShirt(c.x + c.w - 44, c.y - 30, baseShirtColors[(j++)%baseShirtColors.length]);
+    }
+
+    const blocks = staticBlockers();
+    for(const p of pickups){
+      let tries=0;
+      while(overlapsAnyBlocker(p.x, p.y, 20, 18, blocks) && tries<20){
+        p.x += 26;
+        if(p.x > WORLD_W-40) p.x = 20;
+        tries++;
+      }
+      if(p.y >= 0) p.x = clamp(p.x, 8, WORLD_W-28);
+      else p.x = clamp(p.x, 8, VW-28);
+    }
+  }
+  clearAndBuildPickups();
+
+  // ===== Ground traffic (cars + biker + runner) per segment =====
+  const traffic=[];
+  const TRAFFIC_LANE_Y = groundY - 18;
+  const SAFE_START_X = 140;
+  function randChoice(a){ return a[(Math.random()*a.length)|0]; }
+  function segStart(s){ return s*SEG_W; }
+  function segEnd(s){ return (s+1)*SEG_W; }
+
+  function initTraffic(){
+    traffic.length=0;
+    const SPEED_BOOST = 1.18;
+
+    const defs = [
+      {seg:0, types:["car","car","runner"], dir: 1, speed:[0.30,0.50], gap:[130,210]},
+      {seg:1, types:["car","biker","car"],  dir:-1, speed:[0.28,0.46], gap:[140,220]},
+      {seg:2, types:["car","biker","runner"],dir: 1, speed:[0.30,0.50], gap:[150,230]},
+    ];
+
+    const carPalettes = [
+      ["#ff4f4f","#ffd23a"],
+      ["#3ad5ff","#ffffff"],
+      ["#7cff6b","#ffd23a"],
+      ["#ff5bd6","#ffffff"],
+      ["#ffa23a","#ffffff"],
+    ];
+
+    for(const d of defs){
+      const s = d.seg;
+      const start = segStart(s) + 20;
+      const end   = segEnd(s) - 20;
+      const spawnPad = (s===0) ? (SAFE_START_X - start) : 0;
+
+      let x = (d.dir===1) ? (start - 60 - spawnPad) : (end + 60 + spawnPad);
+
+      for(let i=0;i<d.types.length;i++){
+        const t = d.types[i];
+        const sp0 = d.speed[0] + Math.random()*(d.speed[1]-d.speed[0]);
+        const sp = sp0 * SPEED_BOOST;
+        const gap = d.gap[0] + Math.random()*(d.gap[1]-d.gap[0]);
+
+        const w = (t==="car") ? (32 + (Math.random()*10)|0) : (t==="biker") ? 18 : 14;
+        const h = (t==="car") ? 14 : (t==="biker") ? 14 : 16;
+
+        const bodyTop = randChoice(carPalettes);
+
+        const minX = (s===0) ? SAFE_START_X : start;
+
+        const obj = {
+          type:t,
+          seg:s,
+          dir:d.dir,
+          vx: sp * d.dir,
+          x: x,
+          y: (t==="runner") ? (TRAFFIC_LANE_Y - 2) : TRAFFIC_LANE_Y,
+          w,h,
+          gap,
+          body: bodyTop[0],
+          top:  bodyTop[1],
+          shirt: randChoice(["#ffffff","#ffd23a","#3ad5ff","#ff5bd6","#7cff6b","#ffa23a"]),
+          step: 0,
+          minX
+        };
+
+        if(d.dir===1) x -= (gap + w);
+        else x += (gap + w);
+
+        if(s===0 && obj.x < obj.minX) obj.x = obj.minX + i*(gap + w);
+        traffic.push(obj);
+      }
+    }
+  }
+  initTraffic();
+
+  // ✅ traffic is active only for CURRENT segment, and once you move forward,
+  // we delete anything from earlier segments "for good".
+  function cullOldTraffic(){
+    if(phase!==PHASE.GROUND) return;
+
+    const sNow = seg();
+    if(sNow > currentSeg){
+      currentSeg = sNow;
+
+      for(let i=traffic.length-1;i>=0;i--){
+        if(traffic[i].seg < currentSeg){
+          traffic.splice(i,1); // ✅ gone forever
+        }
+      }
+    }
+  }
+
+  function trafficSegmentActive(obj){
+    if(phase!==PHASE.GROUND) return false;
+    return obj.seg === currentSeg; // ✅ only current segment exists now
+  }
+
+  function updateTraffic(dt, now){
+    if(phase!==PHASE.GROUND) return;
+
+    cullOldTraffic();
+
+    for(const o of traffic){
+      if(o.seg !== currentSeg) continue; // safety
+
+      const s=o.seg;
+      const start = segStart(s) + 18;
+      const end   = segEnd(s) - 18;
+
+      o.x += o.vx * (dt/16.67);
+      o.step += dt;
+
+      if(o.dir===1){
+        if(o.x > end + 60){
+          const wrapX = start - (o.gap + o.w);
+          o.x = (s===0) ? Math.min(wrapX, o.minX - (o.gap + o.w)) : wrapX;
+        }
+      }else{
+        if(o.x + o.w < start - 60){
+          const wrapX = end + o.gap;
+          o.x = (s===0) ? Math.max(wrapX, o.minX + 80) : wrapX;
+        }
+      }
+
+      if(aabb(player.x, player.y, player.w, player.h, o.x, o.y, o.w, o.h)){
+        hurt(now);
+      }
+    }
+  }
+
+  function drawCarTraffic(o){
+    const sx=worldToScreenX(o.x)|0, sy=worldToScreenY(o.y)|0;
+    if(sx<-80||sx>VW+80||sy<-80||sy>VH+80) return;
+
+    ctx.fillStyle=o.body;
+    ctx.fillRect(sx, sy+4, o.w, 8);
+
+    ctx.fillStyle=o.top;
+    const topW = Math.max(14, (o.w*0.5)|0);
+    const topX = sx + ((o.w-topW)/2)|0;
+    ctx.fillRect(topX, sy, topW, 6);
+
+    ctx.fillStyle="rgba(255,255,255,0.65)";
+    ctx.fillRect(topX+2, sy+1, 5, 4);
+    ctx.fillRect(topX+9, sy+1, 5, 4);
+
+    ctx.fillStyle="#111";
+    ctx.fillRect(sx+6, sy+12, 6, 4);
+    ctx.fillRect(sx+o.w-12, sy+12, 6, 4);
+    ctx.fillStyle="rgba(255,255,255,0.25)";
+    ctx.fillRect(sx+8, sy+13, 2, 2);
+    ctx.fillRect(sx+o.w-10, sy+13, 2, 2);
+
+    ctx.fillStyle="rgba(255,255,255,0.25)";
+    ctx.fillRect(sx+(o.w/2|0)-4, sy+10, 8, 2);
+  }
+
+  function drawBiker(o){
+    const sx=worldToScreenX(o.x)|0, sy=worldToScreenY(o.y)|0;
+    if(sx<-80||sx>VW+80||sy<-80||sy>VH+80) return;
+
+    const pedal = (((o.step/140)|0)%2);
+
+    ctx.fillStyle="#111";
+    ctx.fillRect(sx+1, sy+12, 6, 4);
+    ctx.fillRect(sx+11, sy+12, 6, 4);
+    ctx.fillStyle="rgba(255,255,255,0.22)";
+    ctx.fillRect(sx+3, sy+13, 2, 2);
+    ctx.fillRect(sx+13, sy+13, 2, 2);
+
+    ctx.fillStyle="#eaeaea";
+    ctx.fillRect(sx+4, sy+10, 10, 2);
+    ctx.fillRect(sx+8, sy+8, 2, 4);
+    ctx.fillRect(sx+12, sy+8, 3, 2);
+
+    ctx.fillStyle=o.shirt;
+    ctx.fillRect(sx+7, sy+3, 6, 5);
+
+    ctx.fillStyle="#d9a57a";
+    ctx.fillRect(sx+8, sy+1, 4, 3);
+
+    ctx.fillStyle="#2b2b2b";
+    if(pedal){
+      ctx.fillRect(sx+7, sy+8, 2, 4);
+      ctx.fillRect(sx+10, sy+8, 2, 4);
+    }else{
+      ctx.fillRect(sx+6, sy+8, 2, 4);
+      ctx.fillRect(sx+11, sy+8, 2, 4);
+    }
+  }
+
+  function drawRunner(o){
+    const sx=worldToScreenX(o.x)|0, sy=worldToScreenY(o.y)|0;
+    if(sx<-80||sx>VW+80||sy<-80||sy>VH+80) return;
+
+    const stride = (((o.step/120)|0)%2);
+
+    ctx.fillStyle="#d9a57a";
+    ctx.fillRect(sx+4, sy+1, 6, 5);
+
+    ctx.fillStyle=o.shirt;
+    ctx.fillRect(sx+3, sy+6, 8, 5);
+
+    ctx.fillStyle="#2b2b2b";
+    ctx.fillRect(sx+4, sy+11, 6, 3);
+
+    ctx.fillStyle="#111";
+    if(stride){
+      ctx.fillRect(sx+3, sy+14, 3, 2);
+      ctx.fillRect(sx+8, sy+14, 4, 2);
+    }else{
+      ctx.fillRect(sx+3, sy+14, 4, 2);
+      ctx.fillRect(sx+9, sy+14, 3, 2);
+    }
+
+    ctx.fillStyle="#d9a57a";
+    ctx.fillRect(sx+2, sy+7, 2, 3);
+    ctx.fillRect(sx+11, sy+7, 2, 3);
+  }
+
+  function drawTraffic(){
+    if(phase!==PHASE.GROUND) return;
+    for(const o of traffic){
+      if(!trafficSegmentActive(o)) continue;
+      if(o.type==="car") drawCarTraffic(o);
+      else if(o.type==="biker") drawBiker(o);
+      else drawRunner(o);
+    }
+  }
+
+  // ===== Sky hazards =====
+  const birds=[];
+  const planes=[];
+  function initSkyHazards(){
+    birds.length=0; planes.length=0;
+    for(let i=0;i<7;i++){
+      birds.push({
+        x:Math.random()*VW,
+        y:-80 - Math.random()*980,
+        vx:(Math.random()<0.5?-1:1)*(0.6+Math.random()*0.8),
+        flap:0
+      });
+    }
+    for(let i=0;i<2;i++){
+      planes.push({
+        x:Math.random()*VW,
+        y:-200 - Math.random()*900,
+        vx:(Math.random()<0.5?-1:1)*(1.6+Math.random()*0.8),
+      });
+    }
+  }
+  initSkyHazards();
+
+  // ===== Disco ball (dance party) =====
+  const disco={ active:false, t:0, y:-90, holdMs:2800 };
+  function startDisco(){
+    disco.active=true; disco.t=0; disco.y=-90;
+  }
+  function updateDisco(dt){
+    if(!disco.active) return;
+    disco.t += dt;
+
+    if(disco.t < 700){
+      const a = disco.t/700;
+      disco.y = (-90 + (64+90)*a);
+    } else if(disco.t < 700 + disco.holdMs){
+      disco.y = 64;
+    } else if(disco.t < 700 + disco.holdMs + 700){
+      const a = (disco.t - (700+disco.holdMs))/700;
+      disco.y = (64 + (-90-64)*a);
+    } else {
+      disco.active=false;
+    }
+  }
+  function drawDiscoBall(now){
+    if(!disco.active) return;
+
+    const cx=(VW/2)|0;
+    const cy=(disco.y)|0;
+
+    ctx.fillStyle="rgba(0,0,0,0.45)";
+    ctx.fillRect(cx-1, 0, 2, Math.max(0, cy-12));
+
+    ctx.fillStyle="rgba(120,180,255,0.10)";
+    for(let i=0;i<48;i++){
+      const w = 8 + i*6;
+      ctx.fillRect((cx - w/2)|0, (cy+6+i*2)|0, w|0, 2);
+    }
+
+    ctx.fillStyle="#eaeaea";
+    for(let y=-16;y<=16;y+=2){
+      const w=Math.sqrt(16*16-y*y)|0;
+      ctx.fillRect(cx-w, cy+y, w*2, 2);
+    }
+
+    const twinkle=((now/110)|0)%2;
+    for(let y=-12;y<=12;y+=4){
+      for(let x=-12;x<=12;x+=4){
+        if(x*x+y*y>12*12) continue;
+        ctx.fillStyle=((x+y+twinkle*2)%8===0) ? "rgba(60,200,255,0.85)" : "rgba(0,0,0,0.18)";
+        ctx.fillRect((cx+x)|0,(cy+y)|0,2,2);
+      }
+    }
+
+    ctx.fillStyle="rgba(255,255,255,0.8)";
+    ctx.fillRect(cx-28, cy-6, 2, 2);
+    ctx.fillRect(cx+26, cy+2, 2, 2);
+    ctx.fillRect(cx-18, cy+18, 2, 2);
+  }
+
+  // ===== Background helpers =====
+  function drawCloud(x,y){
+    ctx.fillStyle="#d8e7ff";
+    const dots=[[0,4],[4,0],[8,0],[12,4],[16,4],[4,4],[8,4],[12,4],[4,8],[8,8],[12,8]];
+    for(const [dx,dy] of dots) ctx.fillRect((x+dx)|0,(y+dy)|0,4,4);
+  }
+
+  function drawFootballFieldDistance(){
+    ctx.fillStyle="rgba(255,255,255,0.12)";
+    ctx.fillRect(0, VH-120, VW, 2);
+
+    const topY=VH-118, botY=VH-56;
+    ctx.fillStyle="#1f6a3a";
+    for(let y=topY;y<botY;y++){
+      const t=(y-topY)/(botY-topY);
+      const halfW=(60 + t*230);
+      const left=(VW/2 - halfW)|0;
+      ctx.fillRect(left, y|0, (halfW*2)|0, 1);
+    }
+    ctx.fillStyle="rgba(255,255,255,0.35)";
+    for(let i=0;i<7;i++){
+      const yy=topY + i*9;
+      const t=(yy-topY)/(botY-topY);
+      const halfW=(60 + t*230);
+      const left=(VW/2 - halfW)|0;
+      ctx.fillRect(left, yy|0, (halfW*2)|0, 1);
+    }
+    ctx.fillStyle="#ffd23a";
+    const gpY=VH-112;
+    ctx.fillRect((VW/2-10)|0, gpY|0, 2, 16);
+    ctx.fillRect((VW/2+8)|0, gpY|0, 2, 16);
+    ctx.fillRect((VW/2-10)|0, gpY|0, 20, 2);
+  }
+
+  function drawBaseballDiamondDistance(){
+    ctx.fillStyle="rgba(255,255,255,0.12)";
+    ctx.fillRect(0, VH-120, VW, 2);
+
+    ctx.fillStyle="#2a7a43";
+    ctx.fillRect(0, VH-120, VW, 64);
+
+    const cx=VW*0.25, cy=VH-78;
+    ctx.fillStyle="#7a4b2a";
+    for(let i=0;i<34;i++){
+      const w=i<17 ? i*3 : (34-i)*3;
+      ctx.fillRect((cx-w)|0, (cy-17+i)|0, (w*2)|0, 1);
+    }
+    ctx.fillStyle="#eaeaea";
+    ctx.fillRect((cx)|0,(cy-16)|0,3,3);
+    ctx.fillRect((cx-28)|0,(cy)|0,3,3);
+    ctx.fillRect((cx+28)|0,(cy)|0,3,3);
+    ctx.fillRect((cx)|0,(cy+16)|0,3,3);
+  }
+
+  function drawBasketballWithHoopsDistance(){
+    ctx.fillStyle="rgba(255,255,255,0.12)";
+    ctx.fillRect(0, VH-120, VW, 2);
+
+    ctx.fillStyle="#3b2a1a";
+    ctx.fillRect(0, VH-120, VW, 64);
+
+    ctx.fillStyle="rgba(255,255,255,0.18)";
+    ctx.fillRect((VW/2)|0, VH-120, 2, 64);
+
+    function hoop(x,y){
+      ctx.fillStyle="rgba(0,0,0,0.35)";
+      ctx.fillRect((x+10)|0, (y+18)|0, 2, 30);
+
+      ctx.fillStyle="#eaeaea";
+      ctx.fillRect(x|0, y|0, 22, 12);
+      ctx.fillStyle="rgba(0,0,0,0.22)";
+      ctx.fillRect((x+6)|0, (y+3)|0, 10, 6);
+
+      ctx.fillStyle="#ff4f4f";
+      ctx.fillRect((x+6)|0, (y+12)|0, 12, 2);
+
+      ctx.fillStyle="rgba(255,255,255,0.65)";
+      ctx.fillRect((x+8)|0, (y+14)|0, 1, 5);
+      ctx.fillRect((x+15)|0, (y+14)|0, 1, 5);
+      ctx.fillRect((x+11)|0, (y+15)|0, 1, 4);
+    }
+    hoop(70, VH-156);
+    hoop(VW-92, VH-156);
+  }
+
+  function drawSkyBackground(){
+    const g = ctx.createLinearGradient(0,0,0,VH);
+    g.addColorStop(0,"#4aa3ff");
+    g.addColorStop(1,"#cfefff");
+    ctx.fillStyle=g;
+    ctx.fillRect(0,0,VW,VH);
+
+    drawCloud(40,40); drawCloud(170,20); drawCloud(360,50);
+    drawCloud(280,90); drawCloud(60,110); drawCloud(420,120);
+  }
+
+  function drawBackground(now){
+    if(state===STATE.TRANSITION){
+      drawSkyBackground();
+      drawCloud(90,160); drawCloud(220,178); drawCloud(360,162);
+      text("TIME TO CHECK OUT!", VW/2, 96, 14, "#ffffff");
+      return;
+    }
+
+    if(phase===PHASE.SKY){
+      drawSkyBackground();
+      return;
+    }
+
+    const s=seg();
+    ctx.fillStyle = (s===0) ? "#0f2144" : (s===1) ? "#15324a" : (s===2) ? "#2a1a3a" : "#111";
+    ctx.fillRect(0,0,VW,VH);
+    drawCloud(60,40); drawCloud(250,28); drawCloud(420,54);
+
+    if(s===0) drawFootballFieldDistance();
+    else if(s===1) drawBaseballDiamondDistance();
+    else if(s===2) drawBasketballWithHoopsDistance();
+    else ctx.fillRect(0, VH-120, VW, 64);
+  }
+
+  // ===== Draw platforms =====
+  function drawPlatforms(){
+    const plats = activePlatforms();
+    for(const p of plats){
+      const sx=worldToScreenX(p.x);
+      const sy=worldToScreenY(p.y);
+      if(sx+p.w<-40 || sx>VW+40 || sy+p.h<-40 || sy>VH+40) continue;
+
+      if(p.cloud){
+        ctx.fillStyle="#ffffff";
+        ctx.fillRect(sx,sy,p.w,3);
+        ctx.fillStyle="#d8e7ff";
+        ctx.fillRect(sx,sy+3,p.w,p.h-3);
+        ctx.fillStyle="rgba(255,255,255,0.35)";
+        for(let i=0;i<p.w;i+=18) ctx.fillRect(sx+i+4, sy+9, 2, 2);
+      }else{
+        ctx.fillStyle="#3bd16f"; ctx.fillRect(sx,sy,p.w,3);
+        ctx.fillStyle="#7a4b2a"; ctx.fillRect(sx,sy+3,p.w,p.h-3);
+        ctx.fillStyle="rgba(0,0,0,0.18)";
+        for(let i=0;i<p.w;i+=16) ctx.fillRect(sx+i+6, sy+10, 2, 2);
+      }
+    }
+  }
+
+  // ===== Shirts drawing =====
+  function drawShirtBig(sx,sy,color){
+    ctx.fillStyle="rgba(0,0,0,0.35)";
+    ctx.fillRect(sx+2,sy+5,16,12);
+    ctx.fillStyle=color;
+    ctx.fillRect(sx+3,sy+6,14,10);
+    ctx.fillRect(sx+0,sy+7,4,6);
+    ctx.fillRect(sx+17,sy+7,4,6);
+    ctx.fillStyle="#111";
+    ctx.fillRect(sx+9,sy+6,2,3);
+    ctx.fillRect(sx+7,sy+6,2,2);
+    ctx.fillRect(sx+11,sy+6,2,2);
+    ctx.fillStyle="rgba(255,255,255,0.2)";
+    ctx.fillRect(sx+3,sy+15,14,1);
+  }
+  function drawPickup(p){
+    if(p.collected) return;
+    const sx=worldToScreenX(p.x), sy=worldToScreenY(p.y);
+    if(sx<-60||sx>VW+60||sy<-60||sy>VH+60) return;
+    drawShirtBig(sx|0,sy|0,p.color);
+    ctx.fillStyle="#fff"; ctx.fillRect((sx+2)|0,(sy+2)|0,2,2);
+  }
+
+  // ===== Cart =====
+  function drawCart(screenX, screenY){
+    const sx = screenX|0;
+    const sy = screenY|0;
+
+    ctx.fillStyle="#ffffff";
+    ctx.fillRect(sx+10, sy+8, 52, 20);
+    ctx.fillStyle="#d8e7ff";
+    ctx.fillRect(sx+12, sy+10, 48, 16);
+    ctx.fillStyle="#b8c6dd";
+    for(let i=0;i<5;i++) ctx.fillRect(sx+14+i*9, sy+12, 2, 14);
+
+    ctx.fillStyle="#ffffff";
+    ctx.fillRect(sx+6, sy+6, 16, 3);
+
+    ctx.fillStyle="#111";
+    ctx.fillRect(sx+18, sy+30, 10, 10);
+    ctx.fillRect(sx+44, sy+30, 10, 10);
+  }
+
+  // ===== Player =====
+  function rainbowColorAt(t){
+    const colors=["#ff4f4f","#ffd23a","#7cff6b","#3ad5ff","#7b61ff","#ff5bd6"];
+    return colors[t%colors.length];
+  }
+  function drawWingsScreen(x,y,flap){
+    ctx.fillStyle="rgba(255,255,255,0.9)";
+    ctx.fillRect(x-7,y+8,7,2); ctx.fillRect(x-9,y+10,7,2); ctx.fillRect(x-7,y+12,7,2);
+    ctx.fillRect(x+14,y+8,7,2); ctx.fillRect(x+16,y+10,7,2); ctx.fillRect(x+14,y+12,7,2);
+    if(flap){
+      ctx.fillStyle="rgba(255,255,255,0.6)";
+      ctx.fillRect(x-11,y+6,7,2);
+      ctx.fillRect(x+18,y+6,7,2);
+    }
+  }
+
+  function drawPlayerAtScreen(sx, sy, now){
+    if(player.invulnMs>0 && ((now/80)|0)%2===0) return;
+
+    const rainbow=shirts.rainbowActive(now);
+    const shirtColor = rainbow ? rainbowColorAt(((now/90)|0)) : shirts.currentColor;
+
+    if(player.hasWings) drawWingsScreen(sx,sy,(((now/120)|0)%2)===0);
+
+    ctx.fillStyle="rgba(0,0,0,0.25)";
+    ctx.fillRect(sx+2,sy+player.h+1,10,2);
+
+    ctx.fillStyle="#2b2b2b";
+    ctx.fillRect(sx+3,sy+12,4,6);
+    ctx.fillRect(sx+8,sy+12,4,6);
+
+    ctx.fillStyle="#111";
+    ctx.fillRect(sx+2,sy+17,5,2);
+    ctx.fillRect(sx+7,sy+17,6,2);
+
+    ctx.fillStyle="#7f8c8d";
+    ctx.fillRect(sx+3,sy+7,10,6);
+
+    ctx.fillStyle="#d9a57a";
+    ctx.fillRect(sx+1,sy+8,2,4);
+    ctx.fillRect(sx+13,sy+8,2,4);
+
+    ctx.fillStyle="#d9a57a";
+    ctx.fillRect(sx+4,sy+1,8,6);
+
+    ctx.fillStyle="#3a2b1f";
+    ctx.fillRect(sx+4,sy+1,8,2);
+    ctx.fillRect(sx+4,sy+1,2,3);
+
+    ctx.fillStyle="#111";
+    const eyeX=(player.dir===1)?sx+9:sx+6;
+    ctx.fillRect(eyeX,sy+4,1,1);
+
+    if(shirtColor){
+      ctx.fillStyle=shirtColor;
+      ctx.fillRect(sx+3,sy+7,10,6);
+      ctx.fillStyle="rgba(0,0,0,0.18)";
+      ctx.fillRect(sx+7,sy+9,2,2);
+    }
+  }
+  function drawPlayerWorld(now){
+    drawPlayerAtScreen(worldToScreenX(player.x)|0, worldToScreenY(player.y)|0, now);
+  }
+
+  // ===== Balls =====
+  function drawEvilEyes(sx,sy){
+    ctx.fillStyle="#ff4f4f";
+    ctx.fillRect(sx+8, sy+12, 5, 3);
+    ctx.fillRect(sx+18, sy+12, 5, 3);
+    ctx.fillStyle="#111";
+    ctx.fillRect(sx+10, sy+13, 1, 1);
+    ctx.fillRect(sx+20, sy+13, 1, 1);
+    ctx.fillStyle="rgba(0,0,0,0.45)";
+    ctx.fillRect(sx+7, sy+11, 6, 1);
+    ctx.fillRect(sx+18, sy+11, 6, 1);
+  }
+
+  function drawBall(b){
+    if(b.used) return;
+    const sx=worldToScreenX(b.x), sy=worldToScreenY(b.y);
+    const r=b.r;
+    if(sx+r*2<-60||sx>VW+60||sy+r*2<-60||sy>VH+60) return;
+
+    const cx=(sx+r)|0, cy=(sy+r)|0;
+
+    if(b.kind==="football"){
+      const rx=22, ry=12;
+      ctx.fillStyle="#8a5a2b";
+      for(let y=-ry;y<=ry;y+=2){
+        const t=1 - Math.abs(y)/ry;
+        const w=(rx * Math.sqrt(Math.max(0,t)))|0;
+        ctx.fillRect(cx-w, (cy+y)|0, w*2, 2);
+      }
+      ctx.fillStyle="rgba(0,0,0,0.25)";
+      ctx.fillRect(cx-1, cy-ry+3, 2, ry*2-6);
+      ctx.fillStyle="#eaeaea";
+      ctx.fillRect(cx-8, cy-1, 16, 2);
+      ctx.fillRect(cx-4, cy-5, 8, 1);
+      ctx.fillRect(cx-4, cy+4, 8, 1);
+      drawEvilEyes((cx-rx+6)|0, (cy-ry+4)|0);
+
+    } else if(b.kind==="baseball"){
+      ctx.fillStyle="#f2f2f2";
+      for(let y=-r;y<=r;y+=2){
+        const w=Math.sqrt(r*r-y*y)|0;
+        ctx.fillRect(cx-w, cy+y, w*2, 2);
+      }
+      ctx.fillStyle="#ff4f4f";
+      for(let i=0;i<8;i++){
+        ctx.fillRect(cx-11+i*3, cy-6 + ((i%2)?1:0), 1, 2);
+        ctx.fillRect(cx-11+i*3, cy+4 + ((i%2)?1:0), 1, 2);
+      }
+      drawEvilEyes((sx-2)|0,(sy-2)|0);
+
+    } else {
+      ctx.fillStyle="#d26a2c";
+      for(let y=-r;y<=r;y+=2){
+        const w=Math.sqrt(r*r-y*y)|0;
+        ctx.fillRect(cx-w, cy+y, w*2, 2);
+      }
+      ctx.fillStyle="rgba(0,0,0,0.40)";
+      ctx.fillRect(cx-1, cy-r+3, 2, r*2-6);
+      ctx.fillRect(cx-r+3, cy-1, r*2-6, 2);
+      ctx.fillRect(cx-11, cy-7, 2, 14);
+      ctx.fillRect(cx+9,  cy-7, 2, 14);
+      drawEvilEyes((sx-2)|0,(sy-2)|0);
+    }
+  }
+
+  function ballRect(b){
+    if(b.kind==="football") return {bx:b.x-8, by:b.y+2, bw:44, bh:24};
+    return {bx:b.x, by:b.y, bw:b.r*2, bh:b.r*2};
+  }
+
+  // ===== Power-ups =====
+  function applyBallPower(b, now){
+    if(b.power==="doublejump"){
+      player.hasDoubleJump=true;
+      player.jumpsLeft=2;
+      showMsg("DOUBLE JUMP!", 1400, now);
+    } else if(b.power==="disco"){
+      showMsg("DANCE PARTY!", 1600, now);
+      shirts.rainbowUntilMs = now + 5000; // ✅ 5 seconds invincible
+      startDisco();
+    } else if(b.power==="wings"){
+      player.hasWings=true;
+      player.flyFuelMs = 12000;
+      transition.t=0;
+      state = STATE.TRANSITION;
+    }
+  }
+
+  // ===== Hurt / lives =====
+  function hurt(now){
+    if (shirts.rainbowActive(now)) return; // ✅ invincible for disco
+    if(player.invulnMs>0) return;
+
+    setLives(ui.lives-1);
+    player.invulnMs = 1200;
+    audio.hurt();
+    showMsg("OUCH!", 700, now);
+    player.vy = -5.5;
+    player.vx += (player.dir===1 ? -2.4 : 2.4);
+
+    if(ui.lives<=0){
+      state = STATE.GAMEOVER;
+      showMsg("GAME OVER", 2000, now);
+    }
+  }
+
+  // ===== Pickups logic =====
+  function updatePickups(now){
+    for(const p of pickups){
+      if(p.collected) continue;
+
+      const isSkyPickup = p.y < 0;
+      if(phase===PHASE.GROUND && isSkyPickup) continue;
+      if(phase===PHASE.SKY && !isSkyPickup) continue;
+
+      if(aabb(player.x,player.y,player.w,player.h,p.x,p.y,20,18)){
+        p.collected = true;
+        audio.pickup();
+        shirts.collected.push(p.color);
+        setCurrentShirtColor(p.color);
+        countEl.textContent = String(shirts.collected.length);
+      }
+    }
+  }
+
+  // ===== Sky hazards =====
+  function updateSkyHazards(dt, now){
+    for(const b of birds){
+      b.x += b.vx;
+      b.flap += 1;
+      if(b.x < -40) b.x = VW+40;
+      if(b.x > VW+40) b.x = -40;
+
+      const bx=b.x, by=b.y, bw=12, bh=8;
+      if(aabb(player.x,player.y,player.w,player.h, camera.x + bx, by, bw, bh)) hurt(now);
+    }
+
+    for(const p of planes){
+      p.x += p.vx;
+      if(p.x < -80) p.x = VW+80;
+      if(p.x > VW+80) p.x = -80;
+
+      const px=p.x, py=p.y, pw=24, ph=8;
+      if(aabb(player.x,player.y,player.w,player.h, camera.x + px, py, pw, ph)) hurt(now);
+    }
+  }
+
+  function drawSkyHazards(){
+    for(const b of birds){
+      const sx=(b.x)|0;
+      const sy=worldToScreenY(b.y)|0;
+      if(sy<-40||sy>VH+40) continue;
+
+      const flap=((b.flap/10)|0)%2;
+      ctx.fillStyle="#111";
+      ctx.fillRect(sx, sy, 10, 4);
+      ctx.fillStyle="#ffd23a";
+      ctx.fillRect(sx+9, sy+1, 3, 2);
+      ctx.fillStyle="#111";
+      if(flap){
+        ctx.fillRect(sx-4, sy-2, 6, 2);
+        ctx.fillRect(sx+4, sy-2, 6, 2);
+      }else{
+        ctx.fillRect(sx-4, sy+4, 6, 2);
+        ctx.fillRect(sx+4, sy+4, 6, 2);
+      }
+      ctx.fillStyle="#fff";
+      ctx.fillRect(sx+2, sy+1, 2, 2);
+    }
+
+    for(const p of planes){
+      const sx=(p.x)|0;
+      const sy=worldToScreenY(p.y)|0;
+      if(sy<-60||sy>VH+60) continue;
+
+      ctx.fillStyle="#eaeaea";
+      ctx.fillRect(sx, sy, 22, 4);
+      ctx.fillRect(sx+6, sy-3, 8, 3);
+      ctx.fillStyle="#ff4f4f";
+      ctx.fillRect(sx+18, sy-1, 4, 2);
+      ctx.fillStyle="rgba(0,0,0,0.25)";
+      ctx.fillRect(sx+4, sy+4, 12, 1);
+    }
+  }
+
+  // ===== Collision resolution =====
+  function resolveCollisions(now){
+    // horizontal
+    player.x += player.vx;
+    for(const p of activePlatforms()){
+      if(aabb(player.x,player.y,player.w,player.h,p.x,p.y,p.w,p.h)){
+        if(player.vx>0) player.x = p.x - player.w;
+        else if(player.vx<0) player.x = p.x + p.w;
+        player.vx = 0;
+      }
+    }
+
+    // balls horizontal hurt
+    for(const b of balls){
+      if(b.used) continue;
+      if(phase!==PHASE.GROUND) continue;
+      const {bx,by,bw,bh}=ballRect(b);
+      if(aabb(player.x,player.y,player.w,player.h,bx,by,bw,bh)){
+        hurt(now);
+        if(player.vx>0) player.x = bx - player.w;
+        else if(player.vx<0) player.x = bx + bw;
+        player.vx=0;
+      }
+    }
+
+    // vertical
+    const prevY=player.y;
+    player.y += player.vy;
+    player.onGround=false;
+
+    for(const p of activePlatforms()){
+      if(aabb(player.x,player.y,player.w,player.h,p.x,p.y,p.w,p.h)){
+        if(player.vy>0){
+          player.y = p.y - player.h;
+          player.vy = 0;
+          player.onGround = true;
+          player.jumpsLeft = player.hasDoubleJump ? 2 : 1;
+        }else if(player.vy<0){
+          player.y = p.y + p.h;
+          player.vy = 0;
+        }
+      }
+    }
+
+    // balls vertical + bump-from-below power
+    for(const b of balls){
+      if(b.used) continue;
+      if(phase!==PHASE.GROUND) continue;
+      const {bx,by,bw,bh}=ballRect(b);
+
+      if(aabb(player.x,player.y,player.w,player.h,bx,by,bw,bh)){
+        if(player.vy>0){
+          hurt(now);
+          player.y = by - player.h;
+          player.vy = 0;
+          player.onGround = true;
+          player.jumpsLeft = player.hasDoubleJump ? 2 : 1;
+        }else if(player.vy<0){
+          player.y = by + bh;
+          player.vy = 0;
+          audio.pop();
+          applyBallPower(b, now);
+          b.used=true;
+        }
+      }else{
+        if(player.vy<0){
+          const oldTop=prevY;
+          const newTop=player.y;
+          const ballBottom=by+bh;
+          const centerX=player.x + player.w*0.5;
+          const withinX = centerX>bx && centerX<bx+bw;
+          if(withinX && oldTop >= ballBottom && newTop < ballBottom){
+            player.y = ballBottom;
+            player.vy = 0;
+            audio.pop();
+            applyBallPower(b, now);
+            b.used=true;
+          }
+        }
+      }
+    }
+
+    // bounds
+    if(phase===PHASE.GROUND){
+      player.x = clamp(player.x, 0, WORLD_W - player.w);
+      if(player.y > VH + 140){
+        player.x=24; player.y=VH-64; player.vx=0; player.vy=0;
+        player.jumpsLeft = player.hasDoubleJump ? 2 : 1;
+      }
+    }else{
+      player.x = clamp(player.x, 0, VW - player.w);
+      if(player.y > 120){
+        player.y = 120;
+        player.vy = -2.0;
+      }
+    }
+  }
+
+  // ===== Camera =====
+  function updateCamera(){
+    if(phase===PHASE.GROUND){
+      camera.x = clamp(player.x - VW*0.45, 0, WORLD_W - VW);
+      camera.y = 0;
+    }else{
+      camera.x = 0;
+      camera.y = player.y - VH*0.55;
+      camera.y = clamp(camera.y, skyFloorY, 40);
+    }
+  }
+
+  // ===== Win logic (ONLY SKY CART) =====
+  const winAnim={t:0, stage:0};
+  function checkGoal(now){
+    if(phase!==PHASE.SKY) return;
+    const g = skyGoal;
+    if(g.reached) return;
+
+    if(aabb(player.x,player.y,player.w,player.h,g.x,g.y,g.w,g.h)){
+      g.reached=true;
+      state=STATE.WIN;
+      winAnim.t=0; winAnim.stage=0;
+      audio.win();
+    }
+  }
+
+  function drawShirtsStackAboveHead(screenX, screenY){
+    const baseX=(screenX + player.w/2 - 10)|0;
+    const baseY=(screenY - 24)|0;
+    for(let i=0;i<shirts.collected.length;i++){
+      const col=shirts.collected[shirts.collected.length-1-i];
+      drawShirtBig(baseX, (baseY - i*9)|0, col);
+      if(i>6) break;
+    }
+  }
+
+  function drawShirtsDropToCart(alpha, cartX, cartY, playerX, playerY){
+    const startX=(playerX + player.w/2 - 10)|0;
+    const startY=(playerY - 24)|0;
+    const endX=(cartX + 16)|0;
+    const endY=(cartY + 10)|0;
+
+    for(let i=0;i<shirts.collected.length;i++){
+      const col=shirts.collected[shirts.collected.length-1-i];
+      const sx0=startX;
+      const sy0=startY - i*9;
+      const sx1=endX + (i%4)*12;
+      const sy1=endY + ((i/4)|0)*12;
+      const sx=(sx0 + (sx1-sx0)*alpha)|0;
+      const sy=(sy0 + (sy1-sy0)*alpha)|0;
+      drawShirtBig(sx, sy, col);
+      if(i>10) break;
+    }
+  }
+
+  function updateWin(dt){
+    winAnim.t += dt;
+    if(winAnim.t < 900) winAnim.stage = 0;
+    else if(winAnim.t < 1700) winAnim.stage = 1;
+    else winAnim.stage = 2;
+  }
+
+  // ===== Game over =====
+  function drawGameOver(now){
+    ctx.fillStyle="#000";
+    ctx.fillRect(0,0,VW,VH);
+    text("GAME OVER", VW/2, 92, 18, "#ff4f4f");
+    text("PRESS A TO PLAY AGAIN", VW/2, 150, 10, "#ffffff");
+    if(startQueued){
+      startQueued=false;
+      resetToPlay();
+    }
+  }
+
+  // ===== Reset =====
+  function resetToPlay(){
+    player.x=24; player.y=VH-64; player.vx=0; player.vy=0;
+    player.onGround=false; player.dir=1;
+    player.hasDoubleJump=false; player.jumpsLeft=1;
+    player.hasWings=false; player.flyFuelMs=0;
+    player.invulnMs=0;
+
+    setLives(3);
+
+    shirts.currentColor=null;
+    shirts.collected.length=0;
+    shirts.rainbowUntilMs=0;
+
+    msg.text=""; msg.untilMs=0;
+
+    for(const b of balls) b.used=false;
+    for(const p of pickups) p.collected=false;
+
+    initSkyHazards();
+    initTraffic();
+    disco.active=false;
+
+    goal.reached=false;
+    skyGoal.reached=false;
+
+    countEl.textContent="0";
+    setCurrentShirtColor(null);
+
+    camera.x=0; camera.y=0;
+    phase=PHASE.GROUND;
+
+    // ✅ reset segment tracking so traffic culling starts fresh
+    currentSeg = 0;
+
+    transition.t=0;
+    state=STATE.PLAY;
+  }
+
+  // ===== Title screen =====
+  function drawIconBall(x,y,kind){
+    const r=14, sx=x, sy=y;
+    const cx=sx+r, cy=sy+r;
+
+    if(kind==="football"){
+      ctx.fillStyle="#8a5a2b";
+      for(let yy=-10;yy<=10;yy+=2){
+        const t=1-Math.abs(yy)/10;
+        const w=(14+(t*10))|0;
+        ctx.fillRect(cx-w, cy+yy, w*2, 2);
+      }
+      ctx.fillStyle="#eaeaea";
+      ctx.fillRect(cx-8, cy-1, 16, 2);
+    } else if(kind==="baseball"){
+      ctx.fillStyle="#f2f2f2";
+      for(let yy=-r;yy<=r;yy+=2){
+        const w=Math.sqrt(r*r-yy*yy)|0;
+        ctx.fillRect(cx-w, cy+yy, w*2, 2);
+      }
+      ctx.fillStyle="#ff4f4f";
+      for(let i=0;i<7;i++) ctx.fillRect(cx-10+i*3, cy-6+((i%2)?1:0), 1, 2);
+    } else {
+      ctx.fillStyle="#d26a2c";
+      for(let yy=-r;yy<=r;yy+=2){
+        const w=Math.sqrt(r*r-yy*yy)|0;
+        ctx.fillRect(cx-w, cy+yy, w*2, 2);
+      }
+      ctx.fillStyle="rgba(0,0,0,0.35)";
+      ctx.fillRect(cx-1, cy-r+3, 2, r*2-6);
+      ctx.fillRect(cx-r+3, cy-1, r*2-6, 2);
+    }
+  }
+  function drawTitle(now){
+    ctx.fillStyle="#0d1020";
+    ctx.fillRect(0,0,VW,VH);
+    ctx.fillStyle="rgba(255,255,255,0.06)";
+    ctx.fillRect(0,VH-46,VW,VH);
+
+    text("OLD TIME SPORTS", VW/2, 40, 18, "#ffffff");
+    text("THE GAME", VW/2, 74, 12, "#ffd23a");
+
+    const baseY=118;
+    const b1=Math.sin(now/220)*6;
+    const b2=Math.sin((now/220)+1.4)*6;
+    const b3=Math.sin((now/220)+2.8)*6;
+    drawIconBall(170, (baseY+b1)|0, "football");
+    drawIconBall(250, (baseY+b2)|0, "baseball");
+    drawIconBall(330, (baseY+b3)|0, "basketball");
+
+    if(((now/350)|0)%2===0){
+      text("PRESS A TO START", VW/2, 210, 12, "#ffffff");
+    }
+    text("BUMP BALLS FROM BELOW. COLLECT SHIRTS. DONT GET HIT!", VW/2, 238, 8, "rgba(255,255,255,0.75)");
+  }
+
+  // ===== Main loop =====
+  let last = performance.now();
+  function loop(now){
+    const dt = now - last;
+    last = now;
+
+    if(state===STATE.TITLE){
+      drawTitle(now);
+      if(startQueued){ startQueued=false; resetToPlay(); }
+      requestAnimationFrame(loop);
+      return;
+    }
+
+    if(state===STATE.GAMEOVER){
+      drawGameOver(now);
+      requestAnimationFrame(loop);
+      return;
+    }
+
+    if(player.invulnMs>0) player.invulnMs = Math.max(0, player.invulnMs - dt);
+
+    // Transition screen (wings)
+    if(state===STATE.TRANSITION){
+      transition.t += dt;
+      drawBackground(now);
+      drawHudHearts();
+      if(transition.t >= transition.dur){
+        phase = PHASE.SKY;
+        player.x = 220; player.y = -40;
+        player.vx = 0; player.vy = 0;
+        camera.x = 0;
+        camera.y = player.y - VH*0.55;
+        showMsg("FLY UP!", 1200, now);
+        state = STATE.PLAY;
+      }
+      requestAnimationFrame(loop);
+      return;
+    }
+
+    updateDisco(dt);
+    updateTraffic(dt, now);
+
+    drawBackground(now);
+    drawPlatforms();
+
+    if(phase===PHASE.GROUND){
+      drawDiscoBall(now);
+      drawTraffic();
+
+      for(const b of balls) drawBall(b);
+      for(const p of pickups) drawPickup(p);
+    }else{
+      drawSkyHazards();
+      for(const p of pickups) drawPickup(p);
+
+      if(state!==STATE.WIN){
+        drawCart(worldToScreenX(skyGoal.x), worldToScreenY(skyGoal.y));
+      }
+      if(state===STATE.PLAY){
+        bubbleText("FLY UP!", VW/2, 6, 10);
+      }
+    }
+
+    if(state===STATE.PLAY){
+      const left=keys.has("ArrowLeft"), right=keys.has("ArrowRight");
+      if(left){ player.vx -= MOVE; player.dir=-1; }
+      if(right){ player.vx += MOVE; player.dir= 1; }
+
+      if(jumpQueued){
+        jumpQueued=false;
+
+        if(phase===PHASE.GROUND){
+          if(player.jumpsLeft>0){
+            player.vy = -JUMP;
+            player.onGround=false;
+            player.jumpsLeft--;
+            audio.jump();
+          }
+        }else{
+          player.vy = Math.min(player.vy, 0);
+          player.vy -= 6.2;
+          audio.jump();
+        }
+      }
+
+      if(phase===PHASE.SKY && player.hasWings && keys.has("Space")){
+        player.vy -= 0.55;
+        player.flyFuelMs -= dt;
+        if(player.flyFuelMs<=0){
+          player.flyFuelMs = 0;
+          player.vy -= 0.12;
+        }
+      }
+
+      player.vx *= FRICTION;
+      player.vx = clamp(player.vx, -4.4, 4.4);
+
+      const grav = (phase===PHASE.GROUND) ? GRAV_GROUND : GRAV_SKY;
+      player.vy += grav;
+      player.vy = clamp(player.vy, -24, MAX_FALL);
+
+      if(phase===PHASE.SKY){
+        updateSkyHazards(dt, now);
+      }
+
+      resolveCollisions(now);
+      updatePickups(now);
+      checkGoal(now);
+
+      // ✅ update camera after movement
+      updateCamera();
+
+      // ✅ detect segment change after movement and cull old traffic immediately
+      cullOldTraffic();
+
+      drawPlayerWorld(now);
+      if(msg.text && now<=msg.untilMs){
+        const sx=(worldToScreenX(player.x) + player.w/2)|0;
+        const sy=(worldToScreenY(player.y) - 34)|0;
+        bubbleText(msg.text, sx, sy, 10);
+      }
+
+    } else if(state===STATE.WIN){
+      updateWin(dt);
+      updateCamera();
+
+      const cart = skyGoal;
+      const cartX = worldToScreenX(cart.x);
+      const cartY = worldToScreenY(cart.y);
+
+      if(winAnim.stage===0){
+        const a = clamp(winAnim.t/900, 0, 1);
+
+        const px0 = worldToScreenX(player.x);
+        const py0 = worldToScreenY(player.y);
+        const px1 = cartX + 30;
+        const py1 = cartY + 14;
+
+        const psx = (px0 + (px1-px0)*a)|0;
+        const hop = Math.sin(a * Math.PI) * 10;
+        const psy = ((py0 + (py1-py0)*a) - hop)|0;
+
+        drawCart(cartX, cartY);
+        drawPlayerAtScreen(psx, psy, now);
+        drawShirtsStackAboveHead(psx, psy);
+
+        bubbleText("CHECKOUT TIME!", VW/2, 6, 10);
+      }
+      else if(winAnim.stage===1){
+        const a = clamp((winAnim.t-900)/800, 0, 1);
+        const psx = (cartX + 30)|0;
+        const psy = (cartY + 14)|0;
+
+        drawCart(cartX, cartY);
+        drawPlayerAtScreen(psx, psy, now);
+        drawShirtsDropToCart(a, cartX, cartY, psx, psy);
+
+        bubbleText("LOADING CART...", VW/2, 6, 10);
+      }
+      else {
+        const p = clamp((winAnim.t-1700)/900, 0, 1);
+        const flyX = (cartX + p*260)|0;
+        const flyY = (cartY - p*70)|0;
+
+        drawCart(flyX, flyY);
+        drawPlayerAtScreen(flyX + 30, flyY + 14, now);
+
+        bubbleText("BYEEE!", VW/2, 6, 10);
+        if(((now/400)|0)%2===0){
+          text("PRESS A TO PLAY AGAIN", VW/2, 248, 10, "#ffffff");
+        }
+
+        if(winAnim.t > 2800 && startQueued){
+          startQueued=false;
+          resetToPlay();
+        }
+      }
+    }
+
+    drawHudHearts();
+    requestAnimationFrame(loop);
+  }
+
+  // init HUD
+  countEl.textContent="0";
+  setCurrentShirtColor(null);
+  setLives(3);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
